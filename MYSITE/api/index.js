@@ -1,157 +1,65 @@
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+
 export const config = {
-  runtime: "edge",
+  api: { bodyParser: false },
+  maxDuration: 60,
 };
 
-const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
+const TARGET = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 
-const HOP_BY_HOP = new Set([
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
+const SKIP = new Set([
+  "host","connection","keep-alive","transfer-encoding","upgrade",
+  "x-vercel-","forwarded","x-forwarded-host","x-forwarded-proto","x-forwarded-port"
 ]);
 
-const FOLLOW_REDIRECTS = false;
-const MAX_REDIRECTS = 5;
-const UPSTREAM_TIMEOUT_MS = 15000;
-
-function buildUpstreamUrl(reqUrl) {
-  const url = new URL(reqUrl);
-  return TARGET_BASE + url.pathname + url.search;
-}
-
-function copyRequestHeaders(req) {
-  const headers = new Headers();
-
-  for (const [key, value] of req.headers) {
-    const k = key.toLowerCase();
-    if (HOP_BY_HOP.has(k)) continue;
-    if (k === "host") continue;
-    if (k.startsWith("x-vercel-")) continue;
-    headers.set(k, value);
-  }
-
-  const url = new URL(req.url);
-  headers.set("x-forwarded-proto", url.protocol.replace(":", ""));
-  headers.set("x-forwarded-host", url.host);
-
-  return headers;
-}
-
-function copyResponseHeaders(upstreamHeaders) {
-  const headers = new Headers();
-  for (const [k, v] of upstreamHeaders) {
-    if (k.toLowerCase() === "transfer-encoding") continue;
-    headers.set(k, v);
-  }
-  return headers;
-}
-
-function addCors(req, headers) {
-  const origin = req.headers.get("origin") || "*";
-  headers.set("access-control-allow-origin", origin);
-  headers.set("vary", "origin");
-  headers.set("access-control-allow-credentials", "true");
-  headers.set(
-    "access-control-allow-methods",
-    "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-  );
-  headers.set(
-    "access-control-allow-headers",
-    req.headers.get("access-control-request-headers") ||
-      "content-type, authorization"
-  );
-  headers.set("access-control-max-age", "86400");
-  return headers;
-}
-
-async function fetchWithTimeout(url, opts, timeoutMs) {
-  const ac = new AbortController();
-  const id = setTimeout(() => ac.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...opts, signal: ac.signal });
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-async function followRedirects(url, opts) {
-  let currentUrl = url;
-  for (let i = 0; i < MAX_REDIRECTS; i++) {
-    const res = await fetchWithTimeout(
-      currentUrl,
-      { ...opts, redirect: "manual" },
-      UPSTREAM_TIMEOUT_MS
-    );
-    if (res.status >= 300 && res.status < 400) {
-      const loc = res.headers.get("location");
-      if (!loc) return res;
-      const next = new URL(loc, currentUrl).toString();
-      if (!next.startsWith(TARGET_BASE)) {
-        return new Response("Blocked redirect", { status: 502 });
-      }
-      currentUrl = next;
-      continue;
-    }
-    return res;
-  }
-  return new Response("Too many redirects", { status: 508 });
-}
-
-export default async function handler(req) {
-  if (!TARGET_BASE) {
-    return new Response("Misconfigured: TARGET_DOMAIN is not set", {
-      status: 500,
-    });
-  }
+export default async function(req, res) {
+  if (!TARGET) return res.status(500).end("TARGET_DOMAIN missing");
 
   if (req.method === "OPTIONS") {
-    const headers = addCors(req, new Headers());
-    return new Response(null, { status: 204, headers });
-  }
-
-  const targetUrl = buildUpstreamUrl(req.url);
-
-  if (!targetUrl.startsWith(TARGET_BASE)) {
-    return new Response("Forbidden", { status: 403 });
-  }
-
-  const method = req.method;
-  const hasBody = method !== "GET" && method !== "HEAD";
-
-  const headers = copyRequestHeaders(req);
-
-  const fetchOpts = {
-    method,
-    headers,
-    redirect: "manual",
-  };
-
-  if (hasBody) {
-    fetchOpts.body = req.body;
+    res.setHeader("access-control-allow-origin", req.headers.origin || "*");
+    res.setHeader("access-control-allow-methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    res.setHeader("access-control-allow-headers", "content-type,authorization");
+    return res.status(204).end();
   }
 
   try {
-    const upstream = FOLLOW_REDIRECTS
-      ? await followRedirects(targetUrl, fetchOpts)
-      : await fetchWithTimeout(targetUrl, fetchOpts, UPSTREAM_TIMEOUT_MS);
+    const headers = {};
+    let ip = null;
+    
+    for (const k in req.headers) {
+      const key = k.toLowerCase();
+      if (key === "x-real-ip") ip = req.headers[k];
+      if (key === "x-forwarded-for" && !ip) ip = req.headers[k];
+      if (SKIP.has(key)) continue;
+      if (key.startsWith("x-vercel-")) continue;
+      headers[key] = req.headers[k];
+    }
+    
+    if (ip) headers["x-forwarded-for"] = ip;
 
-    const respHeaders = copyResponseHeaders(upstream.headers);
-    addCors(req, respHeaders);
+    const opts = { method: req.method, headers, redirect: "manual" };
+    
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      opts.body = Readable.toWeb(req);
+      opts.duplex = "half";
+    }
 
-    return new Response(upstream.body, {
-      status: upstream.status,
-      headers: respHeaders,
-    });
+    const upstream = await fetch(TARGET + req.url, opts);
+
+    res.statusCode = upstream.status;
+    
+    for (const [k, v] of upstream.headers) {
+      if (k !== "transfer-encoding") res.setHeader(k, v);
+    }
+    
+    res.setHeader("access-control-allow-origin", "*");
+    res.setHeader("access-control-allow-credentials", "true");
+
+    if (upstream.body) await pipeline(Readable.fromWeb(upstream.body), res);
+    else res.end();
+    
   } catch {
-    const headersOut = addCors(req, new Headers());
-    return new Response("Bad Gateway: Upstream request failed", {
-      status: 502,
-      headers: headersOut,
-    });
+    if (!res.headersSent) res.status(502).end("Bad Gateway");
   }
 }
